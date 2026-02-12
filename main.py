@@ -11,9 +11,6 @@ from app.config import UPLOAD_DIR
 from app.database import init_db, Document, Chunk
 from app.document_processor import DocumentProcessor
 from app.vector_store import VectorStore
-os.environ["ANONYMIZED_TELEMETRY"] = "False"
-os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
-os.environ["DO_NOT_TRACK"] = "1"
 
 # Инициализация
 app = FastAPI(title="History AI Tutor - Document Processor")
