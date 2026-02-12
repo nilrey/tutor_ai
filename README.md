@@ -1,10 +1,12 @@
 ## Создание проекта
 ### Install Python 3.10.11
     под Windows:
+
     D:/Opt/python/python310/python -m venv venv
     
 ### Запуск вирт. окружения
     под Windows:
+    
     venv/Scripts/activate
 
 ### Установка зависимостей
