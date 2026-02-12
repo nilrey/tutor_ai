@@ -1,16 +1,18 @@
 ## Создание проекта
 ### Install Python 3.10.11
+    под Windows:
     D:/Opt/python/python310/python -m venv venv
+    
+### Запуск вирт. окружения
+    под Windows:
+    venv/Scripts/activate
 
 ### Установка зависимостей
     pip install -r requirements.txt
     
-### Запуск вирт. окружения
-    venv/Scripts/activate
-    
 
 ### Запуск проекта
-    Запустить файл main.py (Проследить что запуск скриптов осущ. из папки venv/Scripts/python)
+    Запустить файл main.py (важно, что запуск скриптов осущ. из папки venv/Scripts/python)
     Будет поднят uvicorn и доступен Swagger UI для тестирования API.
 
 
