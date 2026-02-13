@@ -8,17 +8,147 @@ import warnings
 warnings.filterwarnings("ignore")
 
 from app.config import UPLOAD_DIR
-from app.database import init_db, Document, Chunk
+from app.database import init_db, Document, Chunk, QALog
 from app.document_processor import DocumentProcessor
 from app.vector_store import VectorStore
 
+from app.schemas import QuestionRequest, QuestionResponse, GenerateQuestionsRequest, GenerateQuestionsResponse
+from app.agent import HistoryRAGAgent
+from app.llm_client import LLMClient
+import time
+
+
 # Инициализация
 app = FastAPI(title="History AI Tutor - Document Processor")
+
+# ПОРЯДОК ИНИЦИАЛИЗАЦИИ ВАЖЕН!
+# 1. Сначала БД
+get_db = init_db()
+
+# 2. Потом процессор документов
+doc_processor = DocumentProcessor()
+
+# 3. Потом векторное хранилище
+vector_store = VectorStore()
+
+# 4. ПОТОМ клиент LLM (БЕЗ api_key!)
+print("🔄 Инициализация Ollama клиента...")
+llm_client = LLMClient(
+    model_name="gemma3:4b",  # или "mistral", "gemma:7b"
+    base_url="http://localhost:11434"
+)
+
+# 5. Проверяем доступность Ollama
+if llm_client.is_available():
+    models = llm_client.get_available_models()
+    print(f"✅ Ollama доступна. Модели: {models}")
+else:
+    print("⚠️ Ollama не запущена! Будет использован режим заглушки (mock)")
+
+# 6. И только потом агент
+rag_agent = HistoryRAGAgent(
+    vector_store=vector_store, 
+    llm_client=llm_client
+)
 
 # Получаем функцию для создания сессий БД
 get_db = init_db()  # init_db() возвращает функцию get_db
 doc_processor = DocumentProcessor()
 vector_store = VectorStore()
+
+
+# --- ЭНДПОИНТЫ ДЛЯ AI АГЕНТА ---
+@app.post("/ask", response_model=QuestionResponse)
+async def ask_question(request: QuestionRequest):
+    """
+    Задать фактологический вопрос по учебнику.
+    """
+    try:
+        result = rag_agent.answer_fact(
+            query=request.query,
+            document_id=request.document_id,
+            top_k=request.top_k
+        )
+        return QuestionResponse(**result)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Ошибка при обработке вопроса: {str(e)}")
+
+@app.post("/generate-questions", response_model=GenerateQuestionsResponse)
+async def generate_questions(request: GenerateQuestionsRequest):
+    """
+    Сгенерировать вопросы по конкретному параграфу.
+    """
+    try:
+        result = rag_agent.generate_questions(
+            document_id=request.document_id,
+            chapter=request.chapter,
+            paragraph=request.paragraph,
+            num_questions=request.num_questions
+        )
+        
+        if "error" in result:
+            raise HTTPException(404, result["error"])
+            
+        return GenerateQuestionsResponse(**result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Ошибка при генерации вопросов: {str(e)}")
+
+@app.get("/documents")
+async def list_documents():
+    """
+    Список всех загруженных учебников.
+    """
+    db = get_db()
+    try:
+        docs = db.query(Document).all()
+        return {
+            "documents": [
+                {
+                    "id": d.id,
+                    "filename": d.filename,
+                    "upload_date": d.upload_date.isoformat() if d.upload_date else None,
+                    "chunks": d.total_chunks,
+                    "chapters": []  # Здесь можно добавить структуру
+                }
+                for d in docs
+            ]
+        }
+    finally:
+        db.close()
+
+@app.get("/documents/{doc_id}/structure")
+async def get_document_structure(doc_id: int):
+    """
+    Получить структуру учебника (главы, параграфы).
+    """
+    db = get_db()
+    try:
+        chunks = db.query(Chunk).filter(Chunk.doc_id == doc_id).all()
+        
+        chapters = set()
+        paragraphs = set()
+        
+        for chunk in chunks:
+            if chunk.chapter:
+                chapters.add(chunk.chapter)
+            if chunk.paragraph:
+                paragraphs.add(chunk.paragraph)
+        
+        return {
+            "document_id": doc_id,
+            "chapters": sorted(list(chapters)),
+            "paragraphs": sorted(list(paragraphs)),
+            "total_chunks": len(chunks)
+        }
+    finally:
+        db.close()
+
 
 @app.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
@@ -116,7 +246,7 @@ async def upload_document(file: UploadFile = File(...)):
 @app.get("/stats")
 async def get_stats():
     """Возвращает статистику по загруженным документам"""
-    db = get_db()  # БЫЛО: db = db_session()
+    db = get_db()
     
     try:
         docs = db.query(Document).all()

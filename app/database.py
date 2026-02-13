@@ -10,6 +10,7 @@ engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
+
 class Document(Base):
     __tablename__ = "documents"
     
@@ -49,3 +50,14 @@ def init_db():
     """Инициализация БД - создает таблицы и возвращает функцию для получения сессий"""
     Base.metadata.create_all(bind=engine)
     return get_db  # Возвращаем функцию, а не класс
+
+class QALog(Base):
+    __tablename__ = "qa_logs"
+    
+    id = Column(Integer, primary_key=True)
+    query_text = Column(Text, nullable=False)
+    answer_text = Column(Text, nullable=False)
+    sources_json = Column(Text)  # JSON строка
+    mode = Column(String(50))    # 'fact' или 'questions'
+    topic = Column(String(200))
+    created_at = Column(DateTime, default=datetime.utcnow)

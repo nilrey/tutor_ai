@@ -166,3 +166,17 @@ class VectorStore:
             print(f"✅ Удалены чанки документа {doc_id} из ChromaDB")
         except Exception as e:
             print(f"❌ Ошибка удаления документа {doc_id}: {e}")
+
+    def _load_embedding_model(self):
+        """Ленивая загрузка модели эмбеддингов"""
+        if self.embedding_model is None:
+            print(f"🔄 Загружаем модель эмбеддингов: {EMBEDDING_MODEL}")
+            try:
+                self.embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+                print(f"✅ Модель загружена, размерность: {self.embedding_model.get_sentence_embedding_dimension()}")
+            except Exception as e:
+                print(f"⚠️ Ошибка загрузки модели: {e}")
+                print("🔄 Пробуем загрузить английскую модель...")
+                self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+                print("✅ Загружена английская модель")
+        return self.embedding_model
