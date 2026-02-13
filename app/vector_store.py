@@ -351,3 +351,52 @@ class VectorStore:
         
         # 6. Возвращаем топ результатов
         return combined_chunks[:n_results]
+
+    def rerank_with_llm(self, query: str, candidates: List[Dict], llm_client) -> List[Dict]:
+        """
+        Использует LLM для переранжирования результатов по релевантности
+        """
+        if not candidates:
+            return candidates
+        
+        reranked = []
+        
+        for candidate in candidates[:5]:  # Берем топ-5 кандидатов
+            text = candidate['content'][:500]  # Ограничиваем длину
+            
+            prompt = f"""Оцени, содержит ли этот текст ответ на вопрос.
+
+    Вопрос: {query}
+
+    Текст:
+    {text}
+
+    Оцени релевантность от 0 до 10, где:
+    0 -完全不 релевантно
+    10 - прямо содержит ответ
+
+    Ответь ТОЛЬКО числом."""
+            
+            try:
+                score_text = llm_client.generate(
+                    prompt=prompt,
+                    system_message="Ты - эксперт по оценке релевантности. Отвечай только числом.",
+                    temperature=0.0
+                )
+                
+                # Извлекаем число из ответа
+                import re
+                score_match = re.search(r'\d+', score_text)
+                relevance_score = int(score_match.group()) if score_match else 5
+                
+                candidate['llm_score'] = relevance_score / 10.0
+                reranked.append(candidate)
+                
+            except Exception as e:
+                print(f"⚠️ Ошибка LLM реранкинга: {e}")
+                candidate['llm_score'] = candidate.get('score', 0.5)
+                reranked.append(candidate)
+        
+        # Сортируем по LLM скору
+        reranked.sort(key=lambda x: x.get('llm_score', 0), reverse=True)
+        return reranked
