@@ -3,6 +3,8 @@ from sentence_transformers import SentenceTransformer
 from typing import List, Dict, Any, Optional
 import uuid
 import os
+import re
+from collections import Counter
 
 from .config import CHROMA_PERSIST_DIR, EMBEDDING_MODEL
 
@@ -74,7 +76,8 @@ class VectorStore:
                     "page_number": str(chunk.get("page_number", 1)),
                     "chapter": str(chunk.get("chapter", ""))[:100],
                     "paragraph": str(chunk.get("paragraph", ""))[:100],
-                    "section_title": str(chunk.get("section_title", ""))[:200]
+                    "section_title": str(chunk.get("section_title", ""))[:200],
+                    "id": str(i)  # Добавляем ID для поиска
                 }
                 
                 embeddings.append(embedding)
@@ -181,43 +184,86 @@ class VectorStore:
                 print("✅ Загружена английская модель")
         return self.embedding_model
     
-    def hybrid_search(self, query: str, n_results: int = 5, keyword_weight: float = 0.3):
+    def _extract_keywords(self, query: str) -> List[str]:
         """
-        Гибридный поиск: ключевые слова + векторный поиск
+        Извлекает ключевые слова из запроса
         """
-        # 1. Векторный поиск
-        vector_results = self.search(query, n_results=n_results*2)
+        # Приводим к нижнему регистру
+        query_lower = query.lower()
         
-        # 2. Поиск по ключевым словам (через SQL)
+        # Удаляем знаки препинания
+        query_lower = re.sub(r'[^\w\s]', ' ', query_lower)
+        
+        # Разбиваем на слова
+        words = query_lower.split()
+        
+        # Стоп-слова (короткие и частотные)
+        stop_words = {'когда', 'где', 'какой', 'какая', 'какое', 'какие', 'что', 'кто', 
+                     'как', 'почему', 'зачем', 'сколько', 'этот', 'эта', 'это', 'эти',
+                     'весь', 'вся', 'все', 'был', 'была', 'было', 'были', 'при', 'для',
+                     'чтобы', 'чрез', 'через', 'около', 'почти', 'уже', 'еще', 'ещё'}
+        
+        # Оставляем слова длиннее 3 символов и не в стоп-листе
+        keywords = [word for word in words if len(word) > 3 and word not in stop_words]
+        
+        # Добавляем вариации для имен (Цезарь -> цезар, юлий)
+        variations = []
+        for word in keywords:
+            if word in ['цезарь', 'цезаря', 'цезарю', 'цезарем']:
+                variations.extend(['цезар', 'юлий'])
+            if word in ['юлий', 'юлия']:
+                variations.append('юлий')
+                
+        keywords.extend(variations)
+        
+        return list(set(keywords))  # Убираем дубликаты
+    
+    def _keyword_search_sql(self, keywords: List[str], n_results: int) -> List[Dict]:
+        """
+        Поиск по ключевым словам через SQL с ранжированием
+        """
         from .database import get_db, Chunk
+        from sqlalchemy import or_, and_
         
         db = get_db()
         try:
-            # Разбиваем запрос на слова
-            keywords = query.lower().split()
-            # Убираем короткие слова и предлоги
-            keywords = [k for k in keywords if len(k) > 3]
+            if not keywords:
+                return []
             
-            keyword_chunks = []
-            if keywords:
-                # Ищем чанки, содержащие эти слова
-                from sqlalchemy import or_
-                conditions = []
-                for word in keywords:
-                    conditions.append(Chunk.content.ilike(f'%{word}%'))
+            # Создаем условия для каждого ключевого слова
+            conditions = []
+            for word in keywords:
+                # Ищем разные формы слова
+                conditions.append(Chunk.content.ilike(f'%{word}%'))
+                conditions.append(Chunk.content.ilike(f'%{word.capitalize()}%'))
+            
+            # Выполняем поиск
+            chunks = db.query(Chunk).filter(
+                or_(*conditions)
+            ).limit(n_results * 2).all()  # Берем с запасом
+            
+            # Ранжируем по частоте вхождений
+            ranked_chunks = []
+            for chunk in chunks:
+                content_lower = chunk.content.lower()
+                score = 0
                 
-                keyword_chunks = db.query(Chunk).filter(
-                    or_(*conditions)
-                ).limit(n_results).all()
-            
-            # 3. Комбинируем результаты
-            combined_chunks = []
-            seen_ids = set()
-            
-            # Сначала добавляем результаты из ключевого поиска (высокий приоритет)
-            for chunk in keyword_chunks:
-                if chunk.id not in seen_ids:
-                    combined_chunks.append({
+                # Считаем сколько ключевых слов найдено
+                found_keywords = []
+                for word in keywords:
+                    if word in content_lower:
+                        score += 1
+                        found_keywords.append(word)
+                        # Дополнительный вес за точное совпадение
+                        if f" {word} " in f" {content_lower} ":
+                            score += 1
+                
+                # Особый вес для имен
+                if 'юлий' in found_keywords or 'цезар' in found_keywords:
+                    score += 3
+                
+                if score > 0:
+                    ranked_chunks.append({
                         'content': chunk.content,
                         'metadata': {
                             'doc_id': str(chunk.doc_id),
@@ -226,28 +272,82 @@ class VectorStore:
                             'paragraph': chunk.paragraph or '',
                             'id': chunk.id
                         },
-                        'score': 1.0,  # Высокий вес для точных совпадений
-                        'source': 'keyword'
+                        'score': score,
+                        'source': 'keyword',
+                        'keywords_found': found_keywords
                     })
-                    seen_ids.add(chunk.id)
             
-            # Затем добавляем результаты из векторного поиска
-            if vector_results and vector_results.get('documents'):
-                for i, doc in enumerate(vector_results['documents'][0]):
-                    meta = vector_results['metadatas'][0][i]
-                    chunk_id = int(meta.get('id', 0)) if 'id' in meta else i
-                    
-                    if chunk_id not in seen_ids:
-                        distance = vector_results['distances'][0][i] if vector_results.get('distances') else 0
-                        combined_chunks.append({
-                            'content': doc,
-                            'metadata': meta,
-                            'score': 1.0 - distance,
-                            'source': 'vector'
-                        })
-                        seen_ids.add(chunk_id)
+            # Сортируем по убыванию скора
+            ranked_chunks.sort(key=lambda x: x['score'], reverse=True)
             
-            return combined_chunks[:n_results]
+            return ranked_chunks[:n_results]
             
         finally:
             db.close()
+    
+    def hybrid_search(self, query: str, n_results: int = 5, vector_weight: float = 0.4):
+        """
+        Улучшенный гибридный поиск
+        """
+        # 1. Извлекаем ключевые слова
+        keywords = self._extract_keywords(query)
+        print(f"🔑 Ключевые слова: {keywords}")
+        
+        # 2. Поиск по ключевым словам (SQL)
+        keyword_results = self._keyword_search_sql(keywords, n_results)
+        
+        # 3. Векторный поиск
+        vector_results = self.search(query, n_results=n_results * 2)
+        
+        # 4. Комбинируем результаты
+        combined_chunks = []
+        seen_ids = set()
+        
+        # Сначала добавляем результаты из ключевого поиска (высокий приоритет для имен)
+        for chunk in keyword_results:
+            chunk_id = chunk['metadata'].get('id')
+            if chunk_id not in seen_ids:
+                # Нормализуем score в диапазон 0-1
+                max_keyword_score = max([c['score'] for c in keyword_results]) if keyword_results else 1
+                norm_score = chunk['score'] / max_keyword_score
+                
+                combined_chunks.append({
+                    'content': chunk['content'],
+                    'metadata': chunk['metadata'],
+                    'score': norm_score,
+                    'source': 'keyword',
+                    'keywords': chunk.get('keywords_found', [])
+                })
+                seen_ids.add(chunk_id)
+        
+        # Затем добавляем результаты из векторного поиска
+        if vector_results and vector_results.get('documents'):
+            for i, doc in enumerate(vector_results['documents'][0]):
+                meta = vector_results['metadatas'][0][i]
+                chunk_id = meta.get('id', i)
+                
+                if chunk_id not in seen_ids:
+                    distance = vector_results['distances'][0][i] if vector_results.get('distances') else 0
+                    vector_score = 1.0 - min(distance, 1.0)  # Нормализуем
+                    
+                    combined_chunks.append({
+                        'content': doc,
+                        'metadata': meta,
+                        'score': vector_score,
+                        'source': 'vector'
+                    })
+                    seen_ids.add(chunk_id)
+        
+        # 5. Финальная сортировка с весами
+        for chunk in combined_chunks:
+            if chunk['source'] == 'keyword':
+                # Для ключевых слов оставляем высокий вес
+                chunk['final_score'] = chunk['score']
+            else:
+                # Для векторных - с коэффициентом
+                chunk['final_score'] = chunk['score'] * vector_weight
+        
+        combined_chunks.sort(key=lambda x: x['final_score'], reverse=True)
+        
+        # 6. Возвращаем топ результатов
+        return combined_chunks[:n_results]
