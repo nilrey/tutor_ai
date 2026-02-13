@@ -180,3 +180,74 @@ class VectorStore:
                 self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
                 print("✅ Загружена английская модель")
         return self.embedding_model
+    
+    def hybrid_search(self, query: str, n_results: int = 5, keyword_weight: float = 0.3):
+        """
+        Гибридный поиск: ключевые слова + векторный поиск
+        """
+        # 1. Векторный поиск
+        vector_results = self.search(query, n_results=n_results*2)
+        
+        # 2. Поиск по ключевым словам (через SQL)
+        from .database import get_db, Chunk
+        
+        db = get_db()
+        try:
+            # Разбиваем запрос на слова
+            keywords = query.lower().split()
+            # Убираем короткие слова и предлоги
+            keywords = [k for k in keywords if len(k) > 3]
+            
+            keyword_chunks = []
+            if keywords:
+                # Ищем чанки, содержащие эти слова
+                from sqlalchemy import or_
+                conditions = []
+                for word in keywords:
+                    conditions.append(Chunk.content.ilike(f'%{word}%'))
+                
+                keyword_chunks = db.query(Chunk).filter(
+                    or_(*conditions)
+                ).limit(n_results).all()
+            
+            # 3. Комбинируем результаты
+            combined_chunks = []
+            seen_ids = set()
+            
+            # Сначала добавляем результаты из ключевого поиска (высокий приоритет)
+            for chunk in keyword_chunks:
+                if chunk.id not in seen_ids:
+                    combined_chunks.append({
+                        'content': chunk.content,
+                        'metadata': {
+                            'doc_id': str(chunk.doc_id),
+                            'page_number': str(chunk.page_number),
+                            'chapter': chunk.chapter or '',
+                            'paragraph': chunk.paragraph or '',
+                            'id': chunk.id
+                        },
+                        'score': 1.0,  # Высокий вес для точных совпадений
+                        'source': 'keyword'
+                    })
+                    seen_ids.add(chunk.id)
+            
+            # Затем добавляем результаты из векторного поиска
+            if vector_results and vector_results.get('documents'):
+                for i, doc in enumerate(vector_results['documents'][0]):
+                    meta = vector_results['metadatas'][0][i]
+                    chunk_id = int(meta.get('id', 0)) if 'id' in meta else i
+                    
+                    if chunk_id not in seen_ids:
+                        distance = vector_results['distances'][0][i] if vector_results.get('distances') else 0
+                        combined_chunks.append({
+                            'content': doc,
+                            'metadata': meta,
+                            'score': 1.0 - distance,
+                            'source': 'vector'
+                        })
+                        seen_ids.add(chunk_id)
+            
+            return combined_chunks[:n_results]
+            
+        finally:
+            db.close()

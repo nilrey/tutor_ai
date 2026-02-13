@@ -13,15 +13,24 @@ class HistoryRAGAgent:
         self.vs = vector_store
         self.llm = llm_client
         
-        # Адаптированные промпты для локальных моделей
+#         # Адаптированные промпты для локальных моделей
+#         self.fact_system_prompt = """Ты — профессор истории. Отвечай ТОЛЬКО по тексту учебника.
+
+# Правила:
+# 1. Если ответа нет в тексте - скажи "Ответ не найден в учебнике"
+# 2. В конце ответа ОБЯЗАТЕЛЬНО укажи: Источник: [Глава, §, стр.]
+# 3. Не придумывай факты
+
+# Будь краток и точен."""
+
         self.fact_system_prompt = """Ты — профессор истории. Отвечай ТОЛЬКО по тексту учебника.
 
-Правила:
-1. Если ответа нет в тексте - скажи "Ответ не найден в учебнике"
-2. В конце ответа ОБЯЗАТЕЛЬНО укажи: Источник: [Глава, §, стр.]
-3. Не придумывай факты
+        ВАЖНО: 
+        1. Если в тексте есть прямое упоминание того, о чем спрашивают - используй ЭТОТ фрагмент
+        2. Не используй информацию о других исторических личностях, если вопрос про конкретного человека
+        3. Если не находишь точного ответа - скажи "Ответ не найден в учебнике"
 
-Будь краток и точен."""
+        В конце ответа обязательно укажи: Источник: [стр. X, Глава Y, §Z]"""
         
         # Для генерации вопросов - более простой промпт
         self.questions_system_prompt = """Составь вопросы по тексту. 
@@ -32,94 +41,157 @@ class HistoryRAGAgent:
 Ответы:
 1. Ответ [стр. X]
 2. Ответ [стр. X]"""
+
+def answer_fact(self, query: str, document_id: Optional[int] = None, top_k: int = 5) -> Dict[str, Any]:
+    start_time = time.time()
     
-    def answer_fact(self, query: str, document_id: Optional[int] = None, top_k: int = 2) -> Dict[str, Any]:
-        """
-        Режим 1: Ответ на фактологический вопрос
-        """
-        start_time = time.time()
-        top_k = min(top_k, 2) # Не более 2 чанков для Ollama
-        
-        # 1. Поиск релевантных чанков
-        search_results = self.vs.search(query, n_results=top_k)
-        
-        if not search_results or not search_results.get('documents'):
-            return {
-                "answer": "❌ Не удалось найти информацию в учебнике.",
-                "sources": [],
-                "processing_time": time.time() - start_time
-            }
-        
-        # 2. Фильтрация по document_id если указан
-        documents = search_results['documents'][0]
-        metadatas = search_results['metadatas'][0]
-        distances = search_results.get('distances', [[]])[0]
-        
-        if document_id:
-            filtered = []
-            for i, meta in enumerate(metadatas):
-                if int(meta.get('doc_id', 0)) == document_id:
-                    filtered.append((documents[i], meta, distances[i] if i < len(distances) else None))
-            if not filtered:
-                return {
-                    "answer": f"❌ Документ с ID {document_id} не содержит информации по вашему запросу.",
-                    "sources": [],
-                    "processing_time": time.time() - start_time
-                }
-            documents = [f[0] for f in filtered]
-            metadatas = [f[1] for f in filtered]
-            distances = [f[2] for f in filtered if f[2] is not None]
-        
-        # 3. Сборка контекста
-        context_parts = []
-        for i, (doc, meta) in enumerate(zip(documents, metadatas)):
-            context_parts.append(f"[Фрагмент {i+1} | Стр. {meta.get('page_number', '?')} | Глава: {meta.get('chapter', '?')} | §: {meta.get('paragraph', '?')}]")
-            context_parts.append(doc[:1500])  # Ограничиваем длину
-            context_parts.append("---")
-        
-        context = "\n".join(context_parts)
-        
-        # 4. Формируем промпт
-        prompt = f"""КОНТЕКСТ (ТОЛЬКО ЭТОТ ТЕКСТ ИСПОЛЬЗУЙ ДЛЯ ОТВЕТА):
-{context}
-
-ВОПРОС ПОЛЬЗОВАТЕЛЯ: {query}
-
-Твой ответ (строго по контексту с указанием источников):"""
-        
-        # 5. Отправляем в LLM
-        raw_answer = self.llm.generate(
-            prompt=prompt,
-            system_message=self.fact_system_prompt,
-            temperature=0.0
-        )
-        
-        # 6. Парсим ответ и ссылки
-        answer, sources = self._parse_fact_answer(raw_answer)
-        
-        # 7. Валидация источников
-        valid_sources = self._validate_sources(sources, metadatas)
-        
-        # 8. СОХРАНЯЕМ В БД
-        try:
-            self.save_qa_to_db(
-                query=query,
-                answer=answer,
-                sources=valid_sources,
-                mode="fact",
-                topic=query[:100]  # Первые 100 символов как тема
-            )
-        except Exception as e:
-            print(f"⚠️ Ошибка сохранения в БД: {e}")
-
+    # Используем гибридный поиск
+    combined_results = self.vs.hybrid_search(query, n_results=top_k)
+    
+    if not combined_results:
         return {
-            "answer": answer,
-            "sources": valid_sources,
-            "raw_sources": metadatas,  # Для отладки
-            "confidence": 1.0 - (distances[0] if distances else 0),
+            "answer": "❌ Не удалось найти информацию в учебнике.",
+            "sources": [],
             "processing_time": time.time() - start_time
         }
     
+    # Фильтрация по document_id если указан
+    if document_id:
+        combined_results = [r for r in combined_results 
+                          if int(r['metadata'].get('doc_id', 0)) == document_id]
+    
+    # Сборка контекста
+    context_parts = []
+    sources = []
+    
+    for i, result in enumerate(combined_results):
+        meta = result['metadata']
+        context_parts.append(f"[Фрагмент {i+1} | Стр. {meta.get('page_number', '?')} | {meta.get('chapter', '')} {meta.get('paragraph', '')}]")
+        context_parts.append(result['content'][:800])  # Ограничиваем
+        context_parts.append("---")
+        
+        sources.append({
+            "page": meta.get('page_number', '?'),
+            "chapter": meta.get('chapter', ''),
+            "paragraph": meta.get('paragraph', ''),
+            "source_type": result.get('source', 'vector')
+        })
+    
+    context = "\n".join(context_parts)
+    
+    # Формируем промпт с акцентом на точное совпадение
+    prompt = f"""Текст учебника:
+{context}
+
+Вопрос: {query}
+
+Найди в тексте информацию, ОТНОСЯЩУЮСЯ К ВОПРОСУ.
+Особое внимание обрати на фрагменты, где есть слова: {query}
+
+Ответь кратко и укажи источник:"""
+    
+    raw_answer = self.llm.generate(
+        prompt=prompt,
+        system_message=self.fact_system_prompt,
+        temperature=0.0
+    )
+    
+    return {
+        "answer": raw_answer,
+        "sources": sources,
+        "processing_time": time.time() - start_time
+    }
+
+
+#     def answer_fact(self, query: str, document_id: Optional[int] = None, top_k: int = 2) -> Dict[str, Any]:
+#         """
+#         Режим 1: Ответ на фактологический вопрос
+#         """
+#         start_time = time.time()
+#         top_k = min(top_k, 2) # Не более 2 чанков для Ollama
+        
+#         # 1. Поиск релевантных чанков
+#         search_results = self.vs.search(query, n_results=top_k)
+        
+#         if not search_results or not search_results.get('documents'):
+#             return {
+#                 "answer": "❌ Не удалось найти информацию в учебнике.",
+#                 "sources": [],
+#                 "processing_time": time.time() - start_time
+#             }
+        
+#         # 2. Фильтрация по document_id если указан
+#         documents = search_results['documents'][0]
+#         metadatas = search_results['metadatas'][0]
+#         distances = search_results.get('distances', [[]])[0]
+        
+#         if document_id:
+#             filtered = []
+#             for i, meta in enumerate(metadatas):
+#                 if int(meta.get('doc_id', 0)) == document_id:
+#                     filtered.append((documents[i], meta, distances[i] if i < len(distances) else None))
+#             if not filtered:
+#                 return {
+#                     "answer": f"❌ Документ с ID {document_id} не содержит информации по вашему запросу.",
+#                     "sources": [],
+#                     "processing_time": time.time() - start_time
+#                 }
+#             documents = [f[0] for f in filtered]
+#             metadatas = [f[1] for f in filtered]
+#             distances = [f[2] for f in filtered if f[2] is not None]
+        
+#         # 3. Сборка контекста
+#         context_parts = []
+#         for i, (doc, meta) in enumerate(zip(documents, metadatas)):
+#             context_parts.append(f"[Фрагмент {i+1} | Стр. {meta.get('page_number', '?')} | Глава: {meta.get('chapter', '?')} | §: {meta.get('paragraph', '?')}]")
+#             context_parts.append(doc[:1500])  # Ограничиваем длину
+#             context_parts.append("---")
+        
+#         context = "\n".join(context_parts)
+        
+#         # 4. Формируем промпт
+#         prompt = f"""КОНТЕКСТ (ТОЛЬКО ЭТОТ ТЕКСТ ИСПОЛЬЗУЙ ДЛЯ ОТВЕТА):
+# {context}
+
+# ВОПРОС ПОЛЬЗОВАТЕЛЯ: {query}
+
+# Твой ответ (строго по контексту с указанием источников):"""
+        
+#         # 5. Отправляем в LLM
+#         raw_answer = self.llm.generate(
+#             prompt=prompt,
+#             system_message=self.fact_system_prompt,
+#             temperature=0.0
+#         )
+        
+#         # 6. Парсим ответ и ссылки
+#         answer, sources = self._parse_fact_answer(raw_answer)
+        
+#         # 7. Валидация источников
+#         valid_sources = self._validate_sources(sources, metadatas)
+        
+#         # 8. СОХРАНЯЕМ В БД
+#         try:
+#             self.save_qa_to_db(
+#                 query=query,
+#                 answer=answer,
+#                 sources=valid_sources,
+#                 mode="fact",
+#                 topic=query[:100]  # Первые 100 символов как тема
+#             )
+#         except Exception as e:
+#             print(f"⚠️ Ошибка сохранения в БД: {e}")
+
+#         return {
+#             "answer": answer,
+#             "sources": valid_sources,
+#             "raw_sources": metadatas,  # Для отладки
+#             "confidence": 1.0 - (distances[0] if distances else 0),
+#             "processing_time": time.time() - start_time
+#         }
+    
+
+
     def generate_questions(self, document_id: int, chapter: str, paragraph: str, num_questions: int = 5) -> Dict[str, Any]:
         """
         Режим 2: Генерация вопросов по конкретному параграфу
